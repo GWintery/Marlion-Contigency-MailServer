@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""Replay captured Maildir emails back to Exchange Online via Microsoft Graph."""
+import argparse
+import base64
+import email
+from email import policy
+from email.utils import getaddresses, parseaddr
+import glob
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+DEFAULT_TENANT_ID = "a61c465d-eaa8-406d-aeca-f732d2a826a9"
+DEFAULT_CLIENT_ID = "31dd65fa-71ba-40e2-bf58-934a02894635"
+MAIL_DIRS = ["/home/otpmail/Maildir/new", "/home/otpmail/Maildir/cur"]
+DEFAULT_STATE_FILE = "/home/otpmail/replayed.log"
+GRAPH_SCOPES = "https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/Mail.ReadWrite offline_access"
+INLINE_LIMIT_BYTES = 2_500_000
+CHUNK_SIZE = 8 * 327680  # 2.5 MiB (exact multiple of 320 KiB required by Graph)
+
+
+def list_mail_files():
+    files = []
+    for d in MAIL_DIRS:
+        if os.path.isdir(d):
+            files.extend(glob.glob(os.path.join(d, "*")))
+    files.sort(key=os.path.getmtime)
+    return files
+
+
+def extract_target_recipient(msg):
+    for header in ("X-Original-To", "Delivered-To", "To"):
+        vals = msg.get_all(header) or []
+        for _, addr in getaddresses([str(v) for v in vals]):
+            addr = addr.strip()
+            if "@" in addr and not addr.lower().endswith("@localhost"):
+                local, dom = addr.rsplit("@", 1)
+                return f"{local}@{dom.lower()}"
+    return ""
+
+
+def extract_body_preview(msg):
+    plain, html_body = "", ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if "attachment" in str(part.get_content_disposition() or ""):
+                continue
+            ctype = part.get_content_type()
+            try:
+                content = part.get_content()
+            except Exception:
+                payload = part.get_payload(decode=True)
+                content = payload.decode("utf-8", errors="replace") if payload else ""
+            if not isinstance(content, str):
+                continue
+            if ctype == "text/plain" and not plain:
+                plain = content
+            elif ctype == "text/html" and not html_body:
+                html_body = content
+    else:
+        try:
+            content = msg.get_content()
+        except Exception:
+            payload = msg.get_payload(decode=True)
+            content = payload.decode("utf-8", errors="replace") if payload else ""
+        if isinstance(content, str):
+            if msg.get_content_type() == "text/html":
+                html_body = content
+            else:
+                plain = content
+
+    text = plain
+    if not text and html_body:
+        text = re.sub(r"<style[^>]*>.*?</style>", " ", html_body, flags=re.S | re.I)
+        text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:3000]
+
+
+def http_json(method, url, headers=None, data_bytes=None):
+    req = urllib.request.Request(url, data=data_bytes, method=method)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read()
+            return resp.status, (json.loads(raw.decode("utf-8")) if raw else {})
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")
+        return e.code, {"_error": err_body, "_headers": dict(e.headers)}
+
+
+def device_code_auth(tenant_id, client_id):
+    dc_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/devicecode"
+    form = urllib.parse.urlencode({"client_id": client_id, "scope": GRAPH_SCOPES}).encode("utf-8")
+    status, data = http_json("POST", dc_url, {"Content-Type": "application/x-www-form-urlencoded"}, form)
+    if status != 200:
+        raise RuntimeError(f"Device code request failed ({status}): {data}")
+
+    print("\n" + "=" * 72)
+    print(data["message"])
+    print("=" * 72 + "\n", flush=True)
+
+    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    interval = int(data.get("interval", 5))
+    expires_at = time.time() + int(data.get("expires_in", 900))
+    while time.time() < expires_at:
+        time.sleep(interval)
+        tform = urllib.parse.urlencode({
+            "client_id": client_id,
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": data["device_code"],
+        }).encode("utf-8")
+        st, tdata = http_json("POST", token_url, {"Content-Type": "application/x-www-form-urlencoded"}, tform)
+        if st == 200:
+            tdata["_expires_at"] = time.time() + int(tdata.get("expires_in", 3600))
+            return tdata
+        err_text = tdata.get("_error", "")
+        if "authorization_pending" in err_text:
+            continue
+        if "slow_down" in err_text:
+            interval += 5
+            continue
+        raise RuntimeError(f"Token polling failed ({st}): {err_text}")
+    raise RuntimeError("Device code login timed out.")
+
+
+def refresh_token_if_needed(tenant_id, client_id, tok):
+    if time.time() < tok.get("_expires_at", 0) - 120:
+        return tok
+    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    form = urllib.parse.urlencode({
+        "client_id": client_id,
+        "grant_type": "refresh_token",
+        "refresh_token": tok["refresh_token"],
+        "scope": GRAPH_SCOPES,
+    }).encode("utf-8")
+    st, tdata = http_json("POST", token_url, {"Content-Type": "application/x-www-form-urlencoded"}, form)
+    if st != 200:
+        raise RuntimeError(f"Token refresh failed ({st}): {tdata}")
+    tdata["_expires_at"] = time.time() + int(tdata.get("expires_in", 3600))
+    return tdata
+
+
+def graph_call_with_retry(method, url, token, payload=None):
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    for attempt in range(4):
+        headers = {"Authorization": f"Bearer {token}"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        st, resp = http_json(method, url, headers, body)
+        if st in (200, 201, 202, 204):
+            return st, resp
+        if st in (429, 503, 504):
+            wait = int(resp.get("_headers", {}).get("Retry-After", 5))
+            time.sleep(max(wait, 2))
+            continue
+        raise RuntimeError(f"Graph API {method} {url} failed ({st}): {resp.get('_error', resp)}")
+    raise RuntimeError(f"Graph API {method} {url} exhausted retries.")
+
+
+def send_via_graph(token, target, raw_bytes, msg, mtime_str):
+    orig_from = str(msg.get("From", "(unknown)"))
+    orig_subj = str(msg.get("Subject", "(no subject)"))
+    orig_date = str(msg.get("Date", mtime_str))
+    _, reply_addr = parseaddr(orig_from)
+    preview = extract_body_preview(msg)
+
+    summary_html = (
+        "<div style='font-family:Segoe UI,Arial,sans-serif;font-size:13px;"
+        "background:#f8fafc;border:1px solid #cbd5e1;padding:12px;margin-bottom:14px;'>"
+        "<b>Recovered email received during Microsoft outage</b><br>"
+        f"<b>Original From:</b> {html.escape(orig_from)}<br>"
+        f"<b>Original To:</b> {html.escape(target)}<br>"
+        f"<b>Original Date:</b> {html.escape(orig_date)}<br>"
+        "<i>Full original email (headers, HTML &amp; attachments) is attached as <code>original-message.eml</code>.</i>"
+        "</div>"
+        f"<div style='font-family:Segoe UI,Arial,sans-serif;font-size:14px;white-space:pre-wrap;'>{html.escape(preview)}</div>"
+    )
+
+    base_message = {
+        "subject": f"[Recovered] {orig_subj}"[:245],
+        "body": {"contentType": "HTML", "content": summary_html},
+        "toRecipients": [{"emailAddress": {"address": target}}],
+    }
+    if reply_addr and "@" in reply_addr and " " not in reply_addr:
+        base_message["replyTo"] = [{"emailAddress": {"address": reply_addr}}]
+
+    if len(raw_bytes) <= INLINE_LIMIT_BYTES:
+        base_message["attachments"] = [{
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": "original-message.eml",
+            "contentType": "message/rfc822",
+            "contentBytes": base64.b64encode(raw_bytes).decode("ascii"),
+        }]
+        graph_call_with_retry(
+            "POST",
+            "https://graph.microsoft.com/v1.0/me/sendMail",
+            token,
+            {"message": base_message, "saveToSentItems": False},
+        )
+        return "sendMail"
+
+    # Large email (>2.5 MB): Create draft -> Upload session -> Send
+    _, draft = graph_call_with_retry("POST", "https://graph.microsoft.com/v1.0/me/messages", token, base_message)
+    draft_id = draft["id"]
+    _, sess = graph_call_with_retry(
+        "POST",
+        f"https://graph.microsoft.com/v1.0/me/messages/{draft_id}/attachments/createUploadSession",
+        token,
+        {
+            "attachmentItem": {
+                "attachmentType": "file",
+                "name": "original-message.eml",
+                "size": len(raw_bytes),
+            }
+        },
+    )
+    upload_url = sess["uploadUrl"]
+    total = len(raw_bytes)
+    for start in range(0, total, CHUNK_SIZE):
+        chunk = raw_bytes[start:start + CHUNK_SIZE]
+        end = start + len(chunk) - 1
+        req = urllib.request.Request(upload_url, data=chunk, method="PUT")
+        req.add_header("Content-Length", str(len(chunk)))
+        req.add_header("Content-Range", f"bytes {start}-{end}/{total}")
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            if resp.status not in (200, 201, 202):
+                raise RuntimeError(f"Upload chunk failed with status {resp.status}")
+
+    graph_call_with_retry("POST", f"https://graph.microsoft.com/v1.0/me/messages/{draft_id}/send", token, None)
+    return "uploadSession+send"
+
+
+def check_mx_reverted():
+    bad = []
+    for dom in ("marlion.co.id", "manorian.co.id"):
+        out = subprocess.check_output(["dig", "+short", "@1.1.1.1", dom, "MX"], text=True).strip()
+        if "apps.marlion.co.id" in out or "outlook.com" not in out:
+            bad.append(f"{dom} -> {out or '(empty)'}")
+    return bad
+
+
+def load_done(state_file):
+    done = set()
+    if os.path.isfile(state_file):
+        with open(state_file, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if parts and parts[0]:
+                    done.add(parts[0])
+    return done
+
+
+def main():
+    p = argparse.ArgumentParser(description="Replay Maildir emails to Exchange Online via Microsoft Graph.")
+    p.add_argument("--tenant-id", default=DEFAULT_TENANT_ID)
+    p.add_argument("--client-id", default=DEFAULT_CLIENT_ID)
+    p.add_argument("--send", action="store_true", help="Actually send emails (omit for dry-run).")
+    p.add_argument("--dry-run", action="store_true", help="Preview only (default).")
+    p.add_argument("--filter-recipient", default="", help="Only process emails matching this recipient (case-insensitive).")
+    p.add_argument("--limit", type=int, default=0, help="Max messages to process (0 = all).")
+    p.add_argument("--state-file", default=DEFAULT_STATE_FILE)
+    p.add_argument("--allow-loop-risk", action="store_true", help="Bypass MX check before sending.")
+    args = p.parse_args()
+
+    do_send = args.send and not args.dry_run
+    if do_send and not args.allow_loop_risk:
+        bad_mx = check_mx_reverted()
+        if bad_mx:
+            print("ABORTED: MX records on 1.1.1.1 do NOT point back to Outlook yet:")
+            for b in bad_mx:
+                print(f"  - {b}")
+            print("Restore MX records and wait 15+ minutes first (or pass --allow-loop-risk).")
+            sys.exit(2)
+
+    files = list_mail_files()
+    done = load_done(args.state_file)
+    filter_rcpt = args.filter_recipient.strip().lower()
+
+    queue = []
+    for path in files:
+        fid = os.path.basename(path)
+        if fid in done:
+            continue
+        with open(path, "rb") as f:
+            raw_bytes = f.read()
+        msg = email.message_from_bytes(raw_bytes, policy=policy.default)
+        target = extract_target_recipient(msg)
+        if not target:
+            print(f"[SKIP no recipient] {fid}")
+            continue
+        if filter_rcpt and target.lower() != filter_rcpt:
+            continue
+        mtime_str = datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M:%S")
+        queue.append((path, fid, raw_bytes, msg, target, mtime_str))
+
+    if args.limit > 0:
+        queue = queue[:args.limit]
+
+    print(f"Mode: {'LIVE SEND' if do_send else 'DRY-RUN'} | Already replayed: {len(done)} | Queued now: {len(queue)}")
+    if not queue:
+        return
+
+    if not do_send:
+        for i, (_, fid, raw_bytes, msg, target, mtime_str) in enumerate(queue, 1):
+            mode = "sendMail" if len(raw_bytes) <= INLINE_LIMIT_BYTES else "uploadSession"
+            subj = str(msg.get("Subject", ""))[:60]
+            print(f"  [{i:3d}] {mtime_str} | {len(raw_bytes)//1024:4d} KB ({mode:13s}) | -> {target} | {subj}")
+        return
+
+    tok = device_code_auth(args.tenant_id, args.client_id)
+    sent_ok, failed = 0, 0
+    for i, (_, fid, raw_bytes, msg, target, mtime_str) in enumerate(queue, 1):
+        try:
+            tok = refresh_token_if_needed(args.tenant_id, args.client_id, tok)
+            mode = send_via_graph(tok["access_token"], target, raw_bytes, msg, mtime_str)
+            with open(args.state_file, "a", encoding="utf-8") as sf:
+                sf.write(f"{fid}\t{target}\t{mode}\t{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}\n")
+            sent_ok += 1
+            print(f"  [OK {i}/{len(queue)}] ({mode}) -> {target} | {str(msg.get('Subject', ''))[:50]}")
+            time.sleep(0.5)
+        except Exception as exc:
+            failed += 1
+            print(f"  [ERR {i}/{len(queue)}] -> {target} ({fid}): {exc}", file=sys.stderr)
+
+    print(f"Done. Sent: {sent_ok}, Failed: {failed}, State file: {args.state_file}")
+    if failed:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

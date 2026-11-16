@@ -1,0 +1,16 @@
+[Unit]
+Description=Temporary Read-Only Localhost OTP Mail Viewer
+After=network.target postfix.service
+
+[Service]
+Type=simple
+User=otpmail
+Group=otpmail
+ExecStart=/usr/bin/python3 /usr/local/bin/otp-mail-ui.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

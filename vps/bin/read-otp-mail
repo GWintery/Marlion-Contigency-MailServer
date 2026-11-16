@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+import email
+from email import policy
+import glob
+import os
+import re
+import sys
+from datetime import datetime
+
+MAIL_DIRS = ["/home/otpmail/Maildir/new", "/home/otpmail/Maildir/cur"]
+limit = int(sys.argv[1]) if len(sys.argv) > 1 else 25
+
+files = []
+for d in MAIL_DIRS:
+    if os.path.isdir(d):
+        files.extend(glob.glob(os.path.join(d, "*")))
+
+files.sort(key=os.path.getmtime, reverse=True)
+
+if not files:
+    print("No emails in /home/otpmail/Maildir yet.")
+    sys.exit(0)
+
+def extract_text(msg):
+    body = msg.get_body(preferencelist=("plain", "html"))
+    if body is not None:
+        try:
+            return body.get_content()
+        except Exception:
+            pass
+    for part in msg.walk():
+        ctype = part.get_content_type()
+        if ctype in ("text/plain", "text/html"):
+            try:
+                return part.get_content()
+            except Exception:
+                payload = part.get_payload(decode=True)
+                if payload:
+                    return payload.decode("utf-8", errors="replace")
+    return ""
+
+for path in files[:limit]:
+    with open(path, "rb") as f:
+        msg = email.message_from_binary_file(f, policy=policy.default)
+    mtime = datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M:%S")
+    orig_to = msg.get("X-Original-To") or msg.get("Delivered-To") or msg.get("To", "")
+    subj = str(msg.get("Subject", ""))
+    raw_text = extract_text(msg)
+    clean_text = re.sub(r"<style[^>]*>.*?</style>", " ", raw_text, flags=re.S | re.I)
+    clean_text = re.sub(r"<[^>]+>", " ", clean_text)
+    clean_text = re.sub(r"\s+", " ", clean_text).strip()
+    codes = re.findall(r"\b\d{4,8}\b", f"{subj} {clean_text}")
+    print("=" * 72)
+    print(f"Time:    {mtime}")
+    print(f"From:    {msg.get('From', '')}")
+    print(f"To:      {orig_to}")
+    print(f"Subject: {subj}")
+    if codes:
+        print(f"Codes?:  {', '.join(dict.fromkeys(codes[:8]))}")
+    print(f"Preview: {clean_text[:500]}")

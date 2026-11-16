@@ -1,0 +1,11 @@
+# Never commit captured emails, logs, or local secrets
+Maildir/
+*.eml
+*.db
+replayed.log
+.env
+.env.*
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
